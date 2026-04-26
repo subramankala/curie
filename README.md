@@ -28,14 +28,28 @@ It includes:
 
 1. Clone the repo onto the Raspberry Pi host.
 2. Make sure the Adeept hardware dependencies are installed.
-3. Symlink or copy `scripts/curie` onto your preferred executable path.
-4. Install or mirror `extensions/curie-command-router` into your OpenClaw extensions directory.
-5. Install or mirror `skills/` entries into your OpenClaw skills directory as needed.
+3. Run the installer.
 
 Example:
 
 ```bash
-ln -sf /home/curie/curie-repo/scripts/curie /home/curie/curie
+cd /home/curie/curie-repo
+./install.sh
+```
+
+By default, the installer:
+
+- symlinks `scripts/curie` to `~/curie`
+- symlinks `extensions/curie-command-router` to `~/.openclaw/extensions/curie-command-router`
+- symlinks the Curie-related skill directories to `~/.openclaw/skills/...`
+
+Useful options:
+
+```bash
+./install.sh --dry-run
+./install.sh --copy
+./install.sh --bin-target /usr/local/bin/curie
+./install.sh --openclaw-home /some/other/.openclaw
 ```
 
 ## Main capabilities

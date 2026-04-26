@@ -10,22 +10,24 @@ from pathlib import Path
 
 
 ROBOT_PYTHON = "/usr/bin/python3"
-LOOK_SCRIPT = Path("/home/curie/openclaw/skills/adeept-look/scripts/look.py")
-BATTERY_SCRIPT = Path("/home/curie/openclaw/skills/adeept-battery/scripts/battery.py")
-DRIVE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-drive/scripts/drive.py")
-LIGHT_SCRIPT = Path("/home/curie/openclaw/skills/adeept-light/scripts/light.py")
-DISTANCE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-distance/scripts/distance.py")
-LINE_STATUS_SCRIPT = Path("/home/curie/openclaw/skills/adeept-line/scripts/line_status.py")
-FOLLOW_LINE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-line/scripts/follow_line.py")
-FIND_LINE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-line/scripts/find_line.py")
-KEEP_DISTANCE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-distance/scripts/keep_distance.py")
-SCOUT_AHEAD_SCRIPT = Path("/home/curie/openclaw/skills/curie-super/scripts/scout_ahead.py")
-INSPECT_OBSTACLE_SCRIPT = Path("/home/curie/openclaw/skills/curie-super/scripts/inspect_obstacle.py")
-SENTRY_SCRIPT = Path("/home/curie/openclaw/skills/curie-super/scripts/sentry.py")
-PHOTO_SCRIPT = Path("/home/curie/openclaw/skills/pi-camera-whatsapp/scripts/take-photo.sh")
-PHOTO_DIR = Path("/home/curie/curie-photos")
-CONFIG_FILE = Path("/home/curie/.config/curie/config.json")
-LIGHT_PID_FILE = Path("/home/curie/.cache/curie/light.pid")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SKILLS_DIR = REPO_ROOT / "skills"
+LOOK_SCRIPT = SKILLS_DIR / "adeept-look/scripts/look.py"
+BATTERY_SCRIPT = SKILLS_DIR / "adeept-battery/scripts/battery.py"
+DRIVE_SCRIPT = SKILLS_DIR / "adeept-drive/scripts/drive.py"
+LIGHT_SCRIPT = SKILLS_DIR / "adeept-light/scripts/light.py"
+DISTANCE_SCRIPT = SKILLS_DIR / "adeept-distance/scripts/distance.py"
+LINE_STATUS_SCRIPT = SKILLS_DIR / "adeept-line/scripts/line_status.py"
+FOLLOW_LINE_SCRIPT = SKILLS_DIR / "adeept-line/scripts/follow_line.py"
+FIND_LINE_SCRIPT = SKILLS_DIR / "adeept-line/scripts/find_line.py"
+KEEP_DISTANCE_SCRIPT = SKILLS_DIR / "adeept-distance/scripts/keep_distance.py"
+SCOUT_AHEAD_SCRIPT = SKILLS_DIR / "curie-super/scripts/scout_ahead.py"
+INSPECT_OBSTACLE_SCRIPT = SKILLS_DIR / "curie-super/scripts/inspect_obstacle.py"
+SENTRY_SCRIPT = SKILLS_DIR / "curie-super/scripts/sentry.py"
+PHOTO_SCRIPT = SKILLS_DIR / "pi-camera-whatsapp/scripts/take-photo.sh"
+PHOTO_DIR = Path.home() / "curie-photos"
+CONFIG_FILE = Path.home() / ".config/curie/config.json"
+LIGHT_PID_FILE = Path.home() / ".cache/curie/light.pid"
 
 LOOK_WORDS = {"up", "down", "straight", "left", "right"}
 VIEW_WORDS = {"up", "down", "straight"}

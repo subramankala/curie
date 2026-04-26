@@ -8,6 +8,36 @@ It includes:
 - `extensions/curie-command-router`: an OpenClaw pre-dispatch plugin that intercepts addressed Curie commands
 - `skills/`: foundational and composed robot skills for movement, sensing, camera, lighting, and higher-level routines
 
+## Repo layout
+
+- `scripts/`: entrypoints, including the main `curie` CLI
+- `extensions/`: OpenClaw plugin/router code
+- `skills/`: robot skill manifests and hardware scripts
+
+## Runtime assumptions
+
+- The checked-in `scripts/curie` launcher resolves skill scripts relative to this repo.
+- Runtime state still lives outside the repo:
+  - config: `~/.config/curie/config.json`
+  - light worker pid: `~/.cache/curie/light.pid`
+  - captured photos: `~/curie-photos`
+- The OpenClaw router plugin defaults to `/home/curie/curie-repo/scripts/curie`.
+  Override it with `CURIE_COMMAND_PATH` if you install the repo elsewhere.
+
+## Installation
+
+1. Clone the repo onto the Raspberry Pi host.
+2. Make sure the Adeept hardware dependencies are installed.
+3. Symlink or copy `scripts/curie` onto your preferred executable path.
+4. Install or mirror `extensions/curie-command-router` into your OpenClaw extensions directory.
+5. Install or mirror `skills/` entries into your OpenClaw skills directory as needed.
+
+Example:
+
+```bash
+ln -sf /home/curie/curie-repo/scripts/curie /home/curie/curie
+```
+
 ## Main capabilities
 
 - Addressed command routing like `hey curie go straight`
@@ -32,5 +62,5 @@ It includes:
 
 ## Notes
 
-- The current file paths are set up for the Raspberry Pi host at `/home/curie`.
-- This repo captures the working Curie integration and OpenClaw skill/plugin code, not a full standalone installer.
+- This repo captures the working Curie integration and OpenClaw skill/plugin code.
+- The skills still target the Adeept Raspberry Pi hardware stack and assume local GPIO/I2C/SPI access.

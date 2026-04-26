@@ -4,7 +4,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const execFileAsync = promisify(execFile);
 
-const CURIE_PATH = "/home/curie/curie";
+const CURIE_PATH = process.env.CURIE_COMMAND_PATH || "/home/curie/curie-repo/scripts/curie";
 const WAKE_PREFIX = /^\s*(?:(?:hey|hi|hello|ok(?:ay)?)\s+)?curie\b[\s,:-]*/i;
 
 function extractCurieCommand(text: string | undefined): string | null {

@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+ROBOT_PYTHON = "/usr/bin/python3"
+LOOK_SCRIPT = Path("/home/curie/openclaw/skills/adeept-look/scripts/look.py")
+BATTERY_SCRIPT = Path("/home/curie/openclaw/skills/adeept-battery/scripts/battery.py")
+DRIVE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-drive/scripts/drive.py")
+LIGHT_SCRIPT = Path("/home/curie/openclaw/skills/adeept-light/scripts/light.py")
+DISTANCE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-distance/scripts/distance.py")
+LINE_STATUS_SCRIPT = Path("/home/curie/openclaw/skills/adeept-line/scripts/line_status.py")
+FOLLOW_LINE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-line/scripts/follow_line.py")
+FIND_LINE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-line/scripts/find_line.py")
+KEEP_DISTANCE_SCRIPT = Path("/home/curie/openclaw/skills/adeept-distance/scripts/keep_distance.py")
+SCOUT_AHEAD_SCRIPT = Path("/home/curie/openclaw/skills/curie-super/scripts/scout_ahead.py")
+INSPECT_OBSTACLE_SCRIPT = Path("/home/curie/openclaw/skills/curie-super/scripts/inspect_obstacle.py")
+SENTRY_SCRIPT = Path("/home/curie/openclaw/skills/curie-super/scripts/sentry.py")
+PHOTO_SCRIPT = Path("/home/curie/openclaw/skills/pi-camera-whatsapp/scripts/take-photo.sh")
+PHOTO_DIR = Path("/home/curie/curie-photos")
+CONFIG_FILE = Path("/home/curie/.config/curie/config.json")
+LIGHT_PID_FILE = Path("/home/curie/.cache/curie/light.pid")
+
+LOOK_WORDS = {"up", "down", "straight", "left", "right"}
+VIEW_WORDS = {"up", "down", "straight"}
+DEFAULT_CONFIG = {
+    "drive_speed": 40,
+    "turn_speed": 35,
+    "clearance_cm": 25,
+    "line_follow_speed": 35,
+    "keep_distance_speed": 35,
+    "keep_distance_target_cm": 30,
+}
+DEFAULT_MOVE_SECONDS = 1.0
+DEFAULT_TURN_SECONDS = 0.75
+MIN_MOVE_SECONDS = 0.05
+MAX_MOVE_SECONDS = 30.0
+CM_PER_SECOND_AT_100_SPEED = 25.0
+DEGREES_PER_SECOND_AT_100_SPEED = 180.0
+
+
+def normalize(text: str) -> str:
+    text = text.strip()
+    text = re.sub(
+        r"^\s*(?:hey|hi|hello|ok(?:ay)?)\s+curie\b[:,]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"^\s*curie\b[:,]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    return text.lower()
+
+
+def run_command(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, text=True, capture_output=True, check=False)
+
+
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
+
+
+def load_config() -> dict[str, int]:
+    config = dict(DEFAULT_CONFIG)
+    try:
+        loaded = json.loads(CONFIG_FILE.read_text())
+    except FileNotFoundError:
+        return config
+    except json.JSONDecodeError:
+        return config
+    for key in DEFAULT_CONFIG:
+        value = loaded.get(key)
+        if isinstance(value, int):
+            if key == "clearance_cm":
+                config[key] = int(clamp(value, 5, 200))
+            elif key == "keep_distance_target_cm":
+                config[key] = int(clamp(value, 5, 200))
+            else:
+                config[key] = int(clamp(value, 0, 100))
+    return config
+
+
+def read_distance_cm() -> float:
+    result = run_command([ROBOT_PYTHON, str(DISTANCE_SCRIPT), "--format", "cm"])
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Distance read failed."
+        raise RuntimeError(message)
+    try:
+        return float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("Distance sensor returned invalid output.") from exc
+
+
+def save_config(config: dict[str, int]) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def read_pid_file() -> int | None:
+    try:
+        return int(LIGHT_PID_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def remove_pid_file() -> None:
+    try:
+        LIGHT_PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_light_worker() -> bool:
+    pid = read_pid_file()
+    if pid is None:
+        remove_pid_file()
+        return False
+    if not is_process_alive(pid):
+        remove_pid_file()
+        return False
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(20):
+        if not is_process_alive(pid):
+            remove_pid_file()
+            return True
+        time.sleep(0.05)
+    remove_pid_file()
+    return True
+
+
+def parse_look_direction(command: str) -> str | None:
+    for direction in ("up", "down", "straight", "left", "right"):
+        if re.search(rf"\blook\s+{direction}\b", command):
+            return direction
+    if command in LOOK_WORDS:
+        return command
+    return None
+
+
+def parse_photo_view(command: str) -> str:
+    for direction in ("up", "straight", "down"):
+        if re.search(rf"\b(?:look(?:ing)?|view)\s+{direction}\b", command):
+            return direction
+    return "straight"
+
+
+def is_photo_command(command: str) -> bool:
+    return bool(
+        re.search(r"\b(take|snap|capture|shoot)\b.*\b(photo|picture)\b", command)
+        or re.search(r"\b(photo|picture)\b", command)
+    )
+
+
+def parse_speed_value(command: str) -> int | None:
+    match = re.search(
+        r"\b(?:at|speed)\s+(?:speed\s+)?(\d{1,3})(?:\s*(?:%|percent))?\b",
+        command,
+    )
+    if match:
+        return int(clamp(int(match.group(1)), 0, 100))
+    match = re.search(r"\b(\d{1,3})(?:\s*(?:%|percent))\s+speed\b", command)
+    if match:
+        return int(clamp(int(match.group(1)), 0, 100))
+    return None
+
+
+def parse_seconds(command: str) -> float | None:
+    match = re.search(r"\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec|secs|second|seconds)\b", command)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("ms") or unit.startswith("millisecond"):
+        return value / 1000.0
+    return value
+
+
+def parse_duration_window(command: str) -> float | None:
+    match = re.search(
+        r"\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec|secs|second|seconds|m|min|mins|minute|minutes)\b",
+        command,
+    )
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("ms") or unit.startswith("millisecond"):
+        return value / 1000.0
+    if unit in {"m", "min", "mins"} or unit.startswith("minute"):
+        return value * 60.0
+    return value
+
+
+def parse_distance_cm(command: str) -> float | None:
+    match = re.search(r"\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(cm|centimeter|centimeters|m|meter|meters|in|inch|inches|ft|foot|feet)\b", command)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit == "m" or unit.startswith("meter"):
+        return value * 100.0
+    if unit in {"in", "inch", "inches"}:
+        return value * 2.54
+    if unit in {"ft", "foot", "feet"}:
+        return value * 30.48
+    return value
+
+
+def parse_degrees(command: str) -> float | None:
+    match = re.search(r"\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(deg|degree|degrees)\b", command)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def seconds_for_distance(distance_cm: float, speed: int) -> float:
+    effective_speed = max(speed, 1) / 100.0
+    return distance_cm / (CM_PER_SECOND_AT_100_SPEED * effective_speed)
+
+
+def seconds_for_turn(degrees: float, speed: int) -> float:
+    effective_speed = max(speed, 1) / 100.0
+    return degrees / (DEGREES_PER_SECOND_AT_100_SPEED * effective_speed)
+
+
+def parse_move_command(command: str, config: dict[str, int]) -> tuple[str, int, float, str] | None:
+    action: str | None = None
+    default_seconds = DEFAULT_MOVE_SECONDS
+    default_speed = config["drive_speed"]
+
+    if command in {
+        "forward",
+        "move forward",
+        "go forward",
+        "drive forward",
+        "ahead",
+        "move ahead",
+        "straight",
+        "go straight",
+        "drive straight",
+        "move straight",
+    }:
+        action = "forward"
+    elif command in {
+        "back",
+        "backward",
+        "move back",
+        "move backward",
+        "go back",
+        "reverse",
+        "go reverse",
+        "go backward",
+        "drive backward",
+        "move in reverse",
+    }:
+        action = "back"
+    elif re.search(r"\b(?:move|go|drive)\s+(?:forward|ahead|straight)\b", command):
+        action = "forward"
+    elif re.search(r"\b(?:move|go|drive)\s+(?:back|backward|reverse)\b", command):
+        action = "back"
+    elif re.search(r"\b(?:turn|rotate)\s+left\b", command):
+        action = "turn-left"
+        default_seconds = DEFAULT_TURN_SECONDS
+        default_speed = config["turn_speed"]
+    elif re.search(r"\b(?:turn|rotate)\s+right\b", command):
+        action = "turn-right"
+        default_seconds = DEFAULT_TURN_SECONDS
+        default_speed = config["turn_speed"]
+
+    if not action:
+        return None
+
+    speed = parse_speed_value(command) or default_speed
+    speed = int(clamp(speed, 0, 100))
+    seconds = parse_seconds(command)
+    distance_cm = parse_distance_cm(command) if action in {"forward", "back"} else None
+    degrees = parse_degrees(command) if action in {"turn-left", "turn-right"} else None
+
+    if seconds is not None and distance_cm is not None:
+        raise ValueError("Specify either time or distance, not both.")
+    if seconds is not None and degrees is not None:
+        raise ValueError("Specify either time or degrees, not both.")
+
+    detail = ""
+    if distance_cm is not None:
+        seconds = seconds_for_distance(distance_cm, speed)
+        detail = f"approximately {distance_cm:.1f} cm"
+    elif degrees is not None:
+        seconds = seconds_for_turn(degrees, speed)
+        detail = f"approximately {degrees:.0f} degrees"
+    else:
+        seconds = seconds if seconds is not None else default_seconds
+        detail = f"{seconds:.2f} seconds"
+
+    return action, speed, clamp(seconds, MIN_MOVE_SECONDS, MAX_MOVE_SECONDS), detail
+
+
+def parse_speed_command(command: str) -> tuple[str, int] | None:
+    if command in {"speed", "show speed", "speed status"}:
+        return "show", 0
+
+    match = re.fullmatch(
+        r"(?:set\s+)?(?:(drive|turn|line(?:\s+follow)?|keep(?:\s+distance)?)\s+)?speed(?:\s+to)?\s+(\d{1,3})(?:\s*(?:%|percent))?",
+        command,
+    )
+    if not match:
+        return None
+    scope = match.group(1) or "drive"
+    if scope.startswith("line"):
+        scope = "line"
+    if scope.startswith("keep"):
+        scope = "keep"
+    speed = int(clamp(int(match.group(2)), 0, 100))
+    return scope, speed
+
+
+def parse_line_follow_command(command: str, config: dict[str, int]) -> tuple[int, float] | None:
+    normalized = command.strip()
+    if not re.search(r"\bfollow\b", normalized) or not re.search(r"\bline\b", normalized):
+        return None
+    speed = parse_speed_value(normalized) or config["line_follow_speed"]
+    speed = int(clamp(speed, 0, 100))
+    seconds = parse_seconds(normalized)
+    duration = clamp(seconds if seconds is not None else 5.0, 0.2, 30.0)
+    return speed, duration
+
+
+def parse_find_line_command(command: str, config: dict[str, int]) -> tuple[int, float] | None:
+    normalized = command.strip()
+    if not re.search(r"\bfind\b", normalized) or not re.search(r"\bline\b", normalized):
+        return None
+    speed = parse_speed_value(normalized) or config["line_follow_speed"]
+    speed = int(clamp(speed, 0, 100))
+    seconds = parse_seconds(normalized)
+    duration = clamp(seconds if seconds is not None else 6.0, 0.2, 30.0)
+    return speed, duration
+
+
+def parse_clearance_command(command: str) -> tuple[str, int] | None:
+    if command in {"clearance", "show clearance", "clearance status"}:
+        return "show", 0
+
+    match = re.fullmatch(
+        r"(?:set\s+)?clearance(?:\s+(?:distance|threshold))?(?:\s+to)?\s+(\d+(?:\.\d+)?)\s*(cm|centimeter|centimeters)?",
+        command,
+    )
+    if not match:
+        return None
+    clearance = int(clamp(float(match.group(1)), 5, 200))
+    return "set", clearance
+
+
+def parse_keep_distance_target_command(command: str) -> tuple[str, int] | None:
+    if command in {"keep distance target", "show keep distance target", "distance target"}:
+        return "show", 0
+
+    match = re.fullmatch(
+        r"(?:set\s+)?(?:keep\s+distance|follow\s+distance|distance)\s+target(?:\s+to)?\s+(\d+(?:\.\d+)?)\s*(cm|centimeter|centimeters)?",
+        command,
+    )
+    if not match:
+        return None
+    target = int(clamp(float(match.group(1)), 5, 200))
+    return "set", target
+
+
+def parse_keep_distance_command(command: str, config: dict[str, int]) -> tuple[int, float, float, float] | None:
+    normalized = command.strip()
+    if not re.search(r"\bkeep\b", normalized) or not re.search(r"\bdistance\b", normalized):
+        return None
+    speed = parse_speed_value(normalized) or config["keep_distance_speed"]
+    speed = int(clamp(speed, 0, 100))
+    seconds = parse_seconds(normalized)
+    duration = clamp(seconds if seconds is not None else 5.0, 0.2, 30.0)
+    distance_cm = parse_distance_cm(normalized)
+    target = clamp(distance_cm if distance_cm is not None else config["keep_distance_target_cm"], 5.0, 200.0)
+    tolerance = 5.0
+    tol_match = re.search(
+        r"\b(?:tolerance|within)\s+(\d+(?:\.\d+)?)\s*(cm|centimeter|centimeters)\b",
+        normalized,
+    )
+    if tol_match:
+        tolerance = clamp(float(tol_match.group(1)), 1.0, 50.0)
+    return speed, duration, target, tolerance
+
+
+def parse_scout_ahead_command(command: str, config: dict[str, int]) -> tuple[float, int, float, bool] | None:
+    normalized = command.strip()
+    if "scout ahead" not in normalized:
+        return None
+    speed = parse_speed_value(normalized) or config["drive_speed"]
+    speed = int(clamp(speed, 0, 100))
+    distance_cm = parse_distance_cm(normalized)
+    target_distance = clamp(distance_cm if distance_cm is not None else 100.0, 5.0, 300.0)
+    clearance = float(config["clearance_cm"])
+    clearance_match = re.search(
+        r"\bclearance\s+(\d+(?:\.\d+)?)\s*(cm|centimeter|centimeters)\b",
+        normalized,
+    )
+    if clearance_match:
+        clearance = clamp(float(clearance_match.group(1)), 5.0, 200.0)
+    take_photo = "photo" in normalized or "picture" in normalized
+    return target_distance, speed, clearance, take_photo
+
+
+def parse_inspect_obstacle_command(command: str, config: dict[str, int]) -> tuple[float, int, float, str] | None:
+    normalized = command.strip()
+    if "inspect obstacle" not in normalized:
+        return None
+    speed = parse_speed_value(normalized) or config["keep_distance_speed"]
+    speed = int(clamp(speed, 0, 100))
+    distance_cm = parse_distance_cm(normalized)
+    target = clamp(distance_cm if distance_cm is not None else 25.0, 5.0, 200.0)
+    duration = clamp(parse_duration_window(normalized) or 6.0, 0.2, 30.0)
+    view = parse_photo_view(normalized)
+    return target, speed, duration, view
+
+
+def parse_sentry_command(command: str) -> tuple[float, float] | None:
+    normalized = command.strip()
+    if normalized == "sentry" or normalized.startswith("sentry "):
+        duration = clamp(parse_duration_window(normalized) or 15.0, 0.5, 300.0)
+        threshold = 35.0
+        distance_cm = parse_distance_cm(normalized)
+        if distance_cm is not None:
+            threshold = clamp(distance_cm, 5.0, 200.0)
+        return threshold, duration
+    return None
+
+
+def parse_light_command(command: str) -> str | None:
+    if re.fullmatch(r"(?:turn\s+)?lights?\s+on", command) or command in {"lights on", "light on"}:
+        return "on"
+    if re.fullmatch(r"(?:turn\s+)?lights?\s+off", command) or command in {"lights off", "light off"}:
+        return "off"
+    if re.fullmatch(r"(?:turn\s+)?blinkers?\s+fast", command) or command in {"blinkers fast", "blinker fast"}:
+        return "blink-fast"
+    if re.fullmatch(r"(?:turn\s+)?blinkers?\s+slow", command) or command in {"blinkers slow", "blinker slow"}:
+        return "blink-slow"
+    return None
+
+
+def handle_battery() -> int:
+    result = run_command([ROBOT_PYTHON, str(BATTERY_SCRIPT)])
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Battery read failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    print(
+        f"Battery: {values.get('battery_voltage', '?')}V, "
+        f"{values.get('battery_percent', '?')}%, "
+        f"{values.get('battery_status', 'UNKNOWN')}"
+    )
+    return 0
+
+
+def handle_look(direction: str) -> int:
+    result = run_command([ROBOT_PYTHON, str(LOOK_SCRIPT), direction])
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Look command failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    print(result.stdout.strip())
+    return 0
+
+
+def handle_photo(command: str) -> int:
+    view = parse_photo_view(command)
+    PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+    result = run_command(
+        ["bash", str(PHOTO_SCRIPT), str(PHOTO_DIR), "curie", view]
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Photo capture failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    path = result.stdout.strip()
+    print(f"Photo saved: {path}")
+    return 0
+
+
+def handle_move(command: str, config: dict[str, int]) -> int:
+    try:
+        parsed = parse_move_command(command, config)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not parsed:
+        return 2
+    action, speed, seconds, detail = parsed
+    if action == "forward":
+        try:
+            distance_cm = read_distance_cm()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if distance_cm < config["clearance_cm"]:
+            print(
+                f"Blocked: obstacle at {distance_cm:.1f} cm, below clearance {config['clearance_cm']} cm.",
+                file=sys.stderr,
+            )
+            return 1
+    result = run_command(
+        [
+            ROBOT_PYTHON,
+            str(DRIVE_SCRIPT),
+            action,
+            "--speed",
+            str(speed),
+            "--duration",
+            f"{seconds:.3f}",
+        ]
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Move command failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    print(f"{result.stdout.strip()} Targeted {detail}.")
+    return 0
+
+
+def handle_speed(command: str, config: dict[str, int]) -> int:
+    parsed = parse_speed_command(command)
+    if not parsed:
+        return 2
+    scope, speed = parsed
+    if scope == "show":
+        print(
+            f"Drive speed: {config['drive_speed']}, "
+            f"turn speed: {config['turn_speed']}, "
+            f"line follow speed: {config['line_follow_speed']}, "
+            f"keep distance speed: {config['keep_distance_speed']}"
+        )
+        return 0
+    if scope == "turn":
+        key = "turn_speed"
+    elif scope == "line":
+        key = "line_follow_speed"
+    elif scope == "keep":
+        key = "keep_distance_speed"
+    else:
+        key = "drive_speed"
+    config[key] = speed
+    save_config(config)
+    print(f"{scope.capitalize()} speed set to {speed}.")
+    return 0
+
+
+def handle_clearance(command: str, config: dict[str, int]) -> int:
+    parsed = parse_clearance_command(command)
+    if not parsed:
+        return 2
+    mode, value = parsed
+    if mode == "show":
+        print(f"Forward clearance: {config['clearance_cm']} cm")
+        return 0
+    config["clearance_cm"] = value
+    save_config(config)
+    print(f"Forward clearance set to {value} cm.")
+    return 0
+
+
+def handle_keep_distance_target(command: str, config: dict[str, int]) -> int:
+    parsed = parse_keep_distance_target_command(command)
+    if not parsed:
+        return 2
+    mode, value = parsed
+    if mode == "show":
+        print(f"Keep distance target: {config['keep_distance_target_cm']} cm")
+        return 0
+    config["keep_distance_target_cm"] = value
+    save_config(config)
+    print(f"Keep distance target set to {value} cm.")
+    return 0
+
+
+def handle_distance(config: dict[str, int]) -> int:
+    try:
+        distance_cm = read_distance_cm()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    status = "clear" if distance_cm >= config["clearance_cm"] else "blocked"
+    print(
+        f"Distance ahead: {distance_cm:.1f} cm. "
+        f"Clearance threshold: {config['clearance_cm']} cm ({status})."
+    )
+    return 0
+
+
+def handle_line_status() -> int:
+    result = run_command([ROBOT_PYTHON, str(LINE_STATUS_SCRIPT)])
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Line sensor read failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    print(result.stdout.strip())
+    return 0
+
+
+def handle_line_follow(command: str, config: dict[str, int]) -> int:
+    parsed = parse_line_follow_command(command, config)
+    if not parsed:
+        return 2
+    speed, duration = parsed
+    result = run_command(
+        [
+            ROBOT_PYTHON,
+            str(FOLLOW_LINE_SCRIPT),
+            "--speed",
+            str(speed),
+            "--duration",
+            f"{duration:.3f}",
+        ]
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Line following failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    print(result.stdout.strip())
+    return 0
+
+
+def handle_find_line(command: str, config: dict[str, int]) -> int:
+    parsed = parse_find_line_command(command, config)
+    if not parsed:
+        return 2
+    speed, duration = parsed
+    result = run_command(
+        [
+            ROBOT_PYTHON,
+            str(FIND_LINE_SCRIPT),
+            "--speed",
+            str(speed),
+            "--duration",
+            f"{duration:.3f}",
+        ]
+    )
+    if result.returncode != 0 and not result.stdout.strip():
+        message = result.stderr.strip() or "Find line failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    output = result.stdout.strip() or result.stderr.strip()
+    if output:
+        print(output)
+    return result.returncode
+
+
+def handle_keep_distance(command: str, config: dict[str, int]) -> int:
+    parsed = parse_keep_distance_command(command, config)
+    if not parsed:
+        return 2
+    speed, duration, target, tolerance = parsed
+    result = run_command(
+        [
+            ROBOT_PYTHON,
+            str(KEEP_DISTANCE_SCRIPT),
+            "--speed",
+            str(speed),
+            "--duration",
+            f"{duration:.3f}",
+            "--target",
+            f"{target:.3f}",
+            "--tolerance",
+            f"{tolerance:.3f}",
+        ]
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Keep distance failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    print(result.stdout.strip())
+    return 0
+
+
+def handle_scout_ahead(command: str, config: dict[str, int]) -> int:
+    parsed = parse_scout_ahead_command(command, config)
+    if not parsed:
+        return 2
+    distance_cm, speed, clearance, take_photo = parsed
+    result = run_command(
+        [
+            ROBOT_PYTHON,
+            str(SCOUT_AHEAD_SCRIPT),
+            "--distance",
+            f"{distance_cm:.3f}",
+            "--speed",
+            str(speed),
+            "--clearance",
+            f"{clearance:.3f}",
+            *(["--photo"] if take_photo else []),
+        ]
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Scout ahead failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    print(result.stdout.strip())
+    return 0
+
+
+def handle_inspect_obstacle(command: str, config: dict[str, int]) -> int:
+    parsed = parse_inspect_obstacle_command(command, config)
+    if not parsed:
+        return 2
+    target, speed, duration, view = parsed
+    result = run_command(
+        [
+            ROBOT_PYTHON,
+            str(INSPECT_OBSTACLE_SCRIPT),
+            "--target",
+            f"{target:.3f}",
+            "--speed",
+            str(speed),
+            "--duration",
+            f"{duration:.3f}",
+            "--view",
+            view,
+        ]
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Inspect obstacle failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    print(result.stdout.strip())
+    return 0
+
+
+def handle_sentry(command: str) -> int:
+    parsed = parse_sentry_command(command)
+    if not parsed:
+        return 2
+    threshold, duration = parsed
+    result = run_command(
+        [
+            ROBOT_PYTHON,
+            str(SENTRY_SCRIPT),
+            "--threshold",
+            f"{threshold:.3f}",
+            "--duration",
+            f"{duration:.3f}",
+        ]
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Sentry failed."
+        print(message, file=sys.stderr)
+        return result.returncode
+    print(result.stdout.strip())
+    return 0
+
+
+def handle_lights(command: str) -> int:
+    mode = parse_light_command(command)
+    if not mode:
+        return 2
+
+    stop_light_worker()
+
+    if mode in {"on", "off"}:
+        result = run_command([ROBOT_PYTHON, str(LIGHT_SCRIPT), mode])
+        if result.returncode != 0:
+            message = result.stderr.strip() or result.stdout.strip() or "Light command failed."
+            print(message, file=sys.stderr)
+            return result.returncode
+        remove_pid_file()
+        print(result.stdout.strip())
+        return 0
+
+    LIGHT_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    process = subprocess.Popen(
+        [ROBOT_PYTHON, str(LIGHT_SCRIPT), mode],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    LIGHT_PID_FILE.write_text(f"{process.pid}\n")
+    speed_label = "fast" if mode == "blink-fast" else "slow"
+    print(f"Blinkers started at {speed_label} speed.")
+    return 0
+
+
+def print_help() -> int:
+    print("Local Curie robot control")
+    print("Examples:")
+    print("  curie battery")
+    print("  curie look up")
+    print("  curie look down")
+    print("  curie look left")
+    print("  curie move forward")
+    print("  curie move forward for 2 seconds")
+    print("  curie move forward 25 cm at speed 45")
+    print("  curie move back for 1.5 seconds")
+    print("  curie turn left 90 degrees")
+    print("  curie turn right for 0.5 seconds at speed 30")
+    print("  curie set drive speed 50")
+    print("  curie set turn speed 35")
+    print("  curie set line speed 35")
+    print("  curie set keep speed 35")
+    print("  curie distance")
+    print("  curie clearance")
+    print("  curie set clearance 30 cm")
+    print("  curie keep distance target")
+    print("  curie set distance target 30 cm")
+    print("  curie line status")
+    print("  curie follow line for 5 seconds")
+    print("  curie find line")
+    print("  curie keep distance for 5 seconds")
+    print("  curie scout ahead 1 meter")
+    print("  curie scout ahead 1 meter and take a photo")
+    print("  curie inspect obstacle")
+    print("  curie sentry for 2 minutes")
+    print("  curie lights on")
+    print("  curie lights off")
+    print("  curie blinkers fast")
+    print("  curie blinkers slow")
+    print("  curie take a photo")
+    print("  curie look straight and take a photo")
+    return 0
+
+
+def dispatch(command: str) -> int:
+    config = load_config()
+
+    if not command or command in {"help", "--help", "-h"}:
+        return print_help()
+
+    if "battery" in command or command in {"status", "battery status"}:
+        return handle_battery()
+
+    if command in {
+        "distance",
+        "distance ahead",
+        "how far",
+        "how far ahead",
+        "what is the distance",
+        "what's the distance",
+        "is the path clear",
+        "obstacle check",
+        "clear ahead",
+    }:
+        return handle_distance(config)
+
+    speed_result = handle_speed(command, config)
+    if speed_result != 2:
+        return speed_result
+
+    if command in {
+        "line",
+        "line status",
+        "line sensor",
+        "line sensors",
+        "line sensor status",
+        "is there a line",
+        "line detected",
+    }:
+        return handle_line_status()
+
+    clearance_result = handle_clearance(command, config)
+    if clearance_result != 2:
+        return clearance_result
+
+    keep_distance_target_result = handle_keep_distance_target(command, config)
+    if keep_distance_target_result != 2:
+        return keep_distance_target_result
+
+    line_follow_result = handle_line_follow(command, config)
+    if line_follow_result != 2:
+        return line_follow_result
+
+    find_line_result = handle_find_line(command, config)
+    if find_line_result != 2:
+        return find_line_result
+
+    keep_distance_result = handle_keep_distance(command, config)
+    if keep_distance_result != 2:
+        return keep_distance_result
+
+    scout_result = handle_scout_ahead(command, config)
+    if scout_result != 2:
+        return scout_result
+
+    inspect_result = handle_inspect_obstacle(command, config)
+    if inspect_result != 2:
+        return inspect_result
+
+    sentry_result = handle_sentry(command)
+    if sentry_result != 2:
+        return sentry_result
+
+    light_result = handle_lights(command)
+    if light_result != 2:
+        return light_result
+
+    if is_photo_command(command):
+        return handle_photo(command)
+
+    move_result = handle_move(command, config)
+    if move_result != 2:
+        return move_result
+
+    direction = parse_look_direction(command)
+    if direction:
+        return handle_look(direction)
+
+    print(f"Unsupported Curie command: {command}", file=sys.stderr)
+    return 2
+
+
+def main() -> int:
+    raw = " ".join(sys.argv[1:])
+    command = normalize(raw)
+    return dispatch(command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

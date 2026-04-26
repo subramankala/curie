@@ -1,0 +1,10 @@
+{
+  "id": "curie-command-router",
+  "name": "Curie Command Router",
+  "description": "Intercept addressed Curie robot commands and execute the local curie CLI.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
